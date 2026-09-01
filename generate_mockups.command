@@ -288,7 +288,7 @@ write_jsx() {
 
     // Scale-to-fill (cover): proportionally scale until both dimensions meet
     // the target, then center-crop. Returns a temp File with the result.
-    function preparePhoto(sourcePath, targetW, targetH) {
+    function preparePhoto(sourcePath, targetW, targetH, targetRes) {
         var srcDoc = app.open(new File(sourcePath));
         var srcW   = srcDoc.width.as('px');
         var srcH   = srcDoc.height.as('px');
@@ -297,10 +297,15 @@ write_jsx() {
         var newW  = Math.ceil(srcW * scale);
         var newH  = Math.ceil(srcH * scale);
 
+        // Resolution must match the smart object's internal resolution, not
+        // the source photo's — placedLayerReplaceContents scales the placed
+        // transform using PPI-aware physical size, not raw pixel count, so a
+        // resolution mismatch (e.g. a 72ppi photo replacing 300ppi-calibrated
+        // content) blows up the on-canvas box even when pixel dimensions match.
         srcDoc.resizeImage(
             UnitValue(newW, 'px'),
             UnitValue(newH, 'px'),
-            srcDoc.resolution,
+            targetRes,
             ResampleMethod.BICUBIC
         );
 
@@ -344,21 +349,31 @@ write_jsx() {
 
         doc.activeLayer = smartLayer;
 
-        // Open the smart object to read its internal canvas dimensions,
-        // then close without saving — no content is changed.
-        executeAction(stringIDToTypeID("placedLayerEditContents"), undefined, DialogModes.NO);
-        var soDoc   = app.activeDocument;
-        var canvasW = Math.round(soDoc.width.as('px'));
-        var canvasH = Math.round(soDoc.height.as('px'));
-        soDoc.close(SaveOptions.DONOTSAVECHANGES);
-
-        // Restore focus to the parent doc and the smart object layer.
-        app.activeDocument = doc;
-        doc.activeLayer    = smartLayer;
+        // Read the smart object's internal canvas dimensions straight off the
+        // layer's Action Manager descriptor (smartObjectMore.size). This avoids
+        // placedLayerEditContents, which was found to reset the nonAffineTransform
+        // corner data on Perspective-transformed smart objects even when the
+        // opened contents are closed without saving.
+        var canvasW, canvasH, canvasRes;
+        try {
+            var layerRef = new ActionReference();
+            layerRef.putEnumerated(charIDToTypeID("Lyr "), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+            var layerDesc = executeActionGet(layerRef);
+            var somDesc   = layerDesc.getObjectValue(stringIDToTypeID("smartObjectMore"));
+            var sizeDesc  = somDesc.getObjectValue(stringIDToTypeID("size"));
+            canvasW   = Math.round(sizeDesc.getDouble(stringIDToTypeID("width")));
+            canvasH   = Math.round(sizeDesc.getDouble(stringIDToTypeID("height")));
+            canvasRes = somDesc.getUnitDoubleValue(stringIDToTypeID("resolution"));
+        } catch (dimErr) {
+            throw new Error(
+                "Could not read Smart Object dimensions for \\"" + targetLayer +
+                "\\": " + dimErr.message
+            );
+        }
 
         // Scale photo to fill the smart object canvas (cover, no squeeze).
         // preparePhoto opens a new PS document; restore parent focus after.
-        preparedFile       = preparePhoto(photoPath, canvasW, canvasH);
+        preparedFile       = preparePhoto(photoPath, canvasW, canvasH, canvasRes);
         app.activeDocument = doc;
         doc.activeLayer    = smartLayer;
 
