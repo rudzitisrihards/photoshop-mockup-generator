@@ -1,2 +1,3 @@
 .DS_Store
 _mockup_tmp_*/
+.claude/settings.local.json
