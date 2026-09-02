@@ -25,8 +25,6 @@ printf '╔═══════════════════════
 printf '║        Photoshop Mockup Batch Generator              ║\n'
 printf '╚══════════════════════════════════════════════════════╝\n'
 printf '\n'
-printf 'To copy a folder path in Finder: right-click → Copy as Pathname\n'
-printf '(On older macOS: hold Option, then right-click → Copy "…" as Pathname)\n'
 
 # ── Interactive path collection ────────────────────────────────────────────────
 
@@ -183,7 +181,104 @@ next_suffix() {
 # ── Helper: escape a POSIX path for a JSX double-quoted string literal ─────────
 jsx_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+# ── Temp files ─────────────────────────────────────────────────────────────────
+# All temp files live in one folder next to the script so the trap can nuke
+# the whole directory on exit — including any prep JPEGs orphaned by a PS crash.
+TEMP_DIR="${SCRIPT_DIR}/_mockup_tmp_$$"
+mkdir -p "$TEMP_DIR"
+JSX_TEMP="${TEMP_DIR}/mockup.jsx"
+AS_TEMP="${TEMP_DIR}/mockup.applescript"
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# AppleScript driver — written once; reads JSX_TEMP (updated per iteration)
+# and hands the source text to Photoshop's do javascript command. Also used
+# for the orientation probe below: `do javascript` returns the JS result,
+# which osascript prints to stdout when it's the script's top-level result.
+cat > "$AS_TEMP" <<ASEOF
+set jsCode to read (POSIX file "${JSX_TEMP}") as text
+with timeout of ${OSASCRIPT_TIMEOUT} seconds
+    tell application "${PHOTOSHOP_APP}"
+        do javascript jsCode
+    end tell
+end timeout
+ASEOF
+
+# ── JSX writer: probes a PSD's target Smart Object canvas dimensions ──────────
+# Orientation must come from the Smart Object's own internal canvas, not the
+# PSD document's outer canvas — a template's document canvas can be a
+# different orientation (or square) from the smart object placed inside it
+# (e.g. rotated or perspective-warped placements). Opens the PSD, reads
+# smartObjectMore.size off the layer descriptor (no need to open the smart
+# object's contents), and closes without saving.
+write_probe_jsx() {
+    local psd="$1" layer="$2"
+    local ep el
+    ep=$(jsx_escape "$psd")
+    el=$(jsx_escape "$layer")
+
+    cat > "$JSX_TEMP" <<JSXEOF
+(function () {
+    var psdPath     = "${ep}";
+    var targetLayer = "${el}";
+
+    var savedDialogs = app.displayDialogs;
+    app.displayDialogs = DialogModes.NO;
+
+    function findSmartObject(layers, name) {
+        for (var i = 0; i < layers.length; i++) {
+            var lyr = layers[i];
+            if (lyr.name === name && lyr.kind === LayerKind.SMARTOBJECT) {
+                return lyr;
+            }
+            if (lyr.typename === "LayerSet") {
+                var hit = findSmartObject(lyr.layers, name);
+                if (hit) return hit;
+            }
+        }
+        return null;
+    }
+
+    var doc;
+    try {
+        var psdFile = new File(psdPath);
+        if (!psdFile.exists) {
+            throw new Error("PSD file not found: " + psdPath);
+        }
+
+        doc = app.open(psdFile);
+
+        var smartLayer = findSmartObject(doc.layers, targetLayer);
+        if (!smartLayer) {
+            throw new Error(
+                "LAYER_NOT_FOUND: no SmartObject named \\"" + targetLayer +
+                "\\" in " + psdPath
+            );
+        }
+
+        doc.activeLayer = smartLayer;
+
+        var layerRef = new ActionReference();
+        layerRef.putEnumerated(charIDToTypeID("Lyr "), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+        var layerDesc = executeActionGet(layerRef);
+        var somDesc   = layerDesc.getObjectValue(stringIDToTypeID("smartObjectMore"));
+        var sizeDesc  = somDesc.getObjectValue(stringIDToTypeID("size"));
+        var canvasW   = Math.round(sizeDesc.getDouble(stringIDToTypeID("width")));
+        var canvasH   = Math.round(sizeDesc.getDouble(stringIDToTypeID("height")));
+
+        return canvasW + "," + canvasH;
+    } finally {
+        app.displayDialogs = savedDialogs;
+        if (typeof doc !== "undefined") {
+            doc.close(SaveOptions.DONOTSAVECHANGES);
+        }
+    }
+})();
+JSXEOF
+}
+
 # ── Helper: portrait or landscape from pixel dimensions via sips ───────────────
+# Used for source photos only — plain JPEGs have no smart object indirection,
+# so the file's own pixel dimensions are the right thing to check.
 get_orientation() {
     local file="$1" dims w h
     dims=$(sips -g pixelWidth -g pixelHeight "$file" 2>/dev/null)
@@ -198,14 +293,51 @@ get_orientation() {
     fi
 }
 
+# ── Helper: portrait/landscape for a PSD's target Smart Object, via Photoshop ──
+# Deliberately does not use sips here — sips only sees the PSD's outer
+# document canvas, which can disagree with the smart object's own internal
+# canvas (the thing that actually gets scaled/replaced).
+get_psd_orientation() {
+    local psd="$1" layer="$2" out rc w h
+    write_probe_jsx "$psd" "$layer"
+    out=$(osascript "$AS_TEMP" 2>&1)
+    rc=$?
+    if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+,[0-9]+$ ]]; then
+        printf 'unknown'
+        return 1
+    fi
+    w="${out%%,*}"
+    h="${out##*,}"
+    if [[ "$w" -eq 0 || "$h" -eq 0 ]]; then
+        printf 'unknown'
+        return 1
+    fi
+    if   (( h == w )); then printf 'square'
+    elif (( h > w ));  then printf 'portrait'
+    else                    printf 'landscape'
+    fi
+}
+
+# ── Helper: does a photo's orientation satisfy a PSD's target orientation ─────
+# A square Smart Object accepts either portrait or landscape photos — the
+# cover-crop into a 1:1 target isn't the aggressive crop that orientation
+# matching exists to avoid. Photos are never classified "square" (a square
+# photo still counts as landscape, per get_orientation()) — only a PSD's
+# target Smart Object can be, so only psd_orient is checked for it.
+orientation_matches() {
+    local photo_orient="$1" psd_orient="$2"
+    [[ "$photo_orient" == "unknown" || "$psd_orient" == "unknown" ]] && return 1
+    [[ "$psd_orient" == "square" || "$photo_orient" == "$psd_orient" ]]
+}
+
 # ── Pre-compute orientations for all PSDs and photos ──────────────────────────
 printf 'Reading orientations...\n'
 
 MOCKUP_ORIENTATIONS=()
 for psd in "${MOCKUPS[@]}"; do
     orient="unknown"
-    orient=$(get_orientation "$psd") || \
-        printf 'Warning: cannot read dimensions for %s — will be skipped\n' \
+    orient=$(get_psd_orientation "$psd" "$TARGET_LAYER_NAME") || \
+        printf 'Warning: cannot read Smart Object dimensions for %s — will be skipped\n' \
             "$(basename "$psd")" >&2
     MOCKUP_ORIENTATIONS+=("$orient")
 done
@@ -223,32 +355,11 @@ done
 total=0
 for pi in "${!PHOTOS[@]}"; do
     for mi in "${!MOCKUPS[@]}"; do
-        if [[ "${PHOTO_ORIENTATIONS[$pi]}" != "unknown" \
-           && "${PHOTO_ORIENTATIONS[$pi]}" == "${MOCKUP_ORIENTATIONS[$mi]}" ]]; then
+        if orientation_matches "${PHOTO_ORIENTATIONS[$pi]}" "${MOCKUP_ORIENTATIONS[$mi]}"; then
             total=$(( total + 1 ))
         fi
     done
 done
-
-# ── Temp files ─────────────────────────────────────────────────────────────────
-# All temp files live in one folder next to the script so the trap can nuke
-# the whole directory on exit — including any prep JPEGs orphaned by a PS crash.
-TEMP_DIR="${SCRIPT_DIR}/_mockup_tmp_$$"
-mkdir -p "$TEMP_DIR"
-JSX_TEMP="${TEMP_DIR}/mockup.jsx"
-AS_TEMP="${TEMP_DIR}/mockup.applescript"
-trap 'rm -rf "$TEMP_DIR"' EXIT
-
-# AppleScript driver — written once; reads JSX_TEMP (updated per iteration)
-# and hands the source text to Photoshop's do javascript command.
-cat > "$AS_TEMP" <<ASEOF
-set jsCode to read (POSIX file "${JSX_TEMP}") as text
-with timeout of ${OSASCRIPT_TIMEOUT} seconds
-    tell application "${PHOTOSHOP_APP}"
-        do javascript jsCode
-    end tell
-end timeout
-ASEOF
 
 # ── JSX writer: embeds per-iteration paths into the ExtendScript source ────────
 write_jsx() {
@@ -414,11 +525,12 @@ JSXEOF
 }
 
 # ── Orientation breakdown for header ──────────────────────────────────────────
-m_portrait=0; m_landscape=0
+m_portrait=0; m_landscape=0; m_square=0
 for o in "${MOCKUP_ORIENTATIONS[@]}"; do
     case "$o" in
         portrait)  m_portrait=$(( m_portrait + 1 ))  ;;
         landscape) m_landscape=$(( m_landscape + 1 )) ;;
+        square)    m_square=$(( m_square + 1 )) ;;
     esac
 done
 
@@ -430,8 +542,8 @@ for o in "${PHOTO_ORIENTATIONS[@]}"; do
     esac
 done
 
-printf 'Mockups : %d PSDs  (portrait: %d, landscape: %d)\n' \
-    "${#MOCKUPS[@]}" "$m_portrait" "$m_landscape"
+printf 'Mockups : %d PSDs  (portrait: %d, landscape: %d, square: %d)\n' \
+    "${#MOCKUPS[@]}" "$m_portrait" "$m_landscape" "$m_square"
 printf 'Photos  : %d JPGs  (portrait: %d, landscape: %d)\n' \
     "${#PHOTOS[@]}" "$p_portrait" "$p_landscape"
 printf 'Matching: %d exports\n' "$total"
@@ -466,8 +578,7 @@ for pi in "${!PHOTOS[@]}"; do
         psd_orient="${MOCKUP_ORIENTATIONS[$mi]}"
         k=$(( mi + 1 ))
 
-        if [[ "$photo_orient" == "unknown" || "$psd_orient" == "unknown" \
-           || "$photo_orient" != "$psd_orient" ]]; then
+        if ! orientation_matches "$photo_orient" "$psd_orient"; then
             skipped=$(( skipped + 1 ))
             continue
         fi
